@@ -1,0 +1,168 @@
+# ==============================
+
+# Node / Frontend (React, Plasmo)
+
+# ==============================
+
+node_modules/
+dist/
+build/
+out/
+.next/
+.cache/
+.turbo/
+
+# Package manager files
+
+pnpm-lock.yaml
+yarn.lock
+package-lock.json
+
+# Logs
+
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+logs
+*.log
+
+# Environment variables
+
+.env
+.env.*
+!.env.example
+
+# OS files
+
+.DS_Store
+Thumbs.db
+
+# Editor directories
+
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ==============================
+
+# Chrome Extension Build Files
+
+# ==============================
+
+.plasmo/
+.plasmo-cache/
+extension.zip
+build/
+
+# ==============================
+
+# Python / FastAPI
+
+# ==============================
+
+**pycache**/
+*.pyc
+*.pyo
+*.pyd
+*.pyc.*
+
+# Python virtual environments
+
+venv/
+.venv/
+env/
+ENV/
+
+# Python packaging
+
+*.egg-info/
+dist/
+build/
+
+# pytest
+
+.pytest_cache/
+
+# mypy
+
+.mypy_cache/
+
+# ==============================
+
+# Ollama / AI Models
+
+# ==============================
+
+models/
+*.gguf
+*.bin
+
+# ==============================
+
+# Local data files
+
+# ==============================
+
+data/
+tmp/
+temp/
+*.tmp
+
+# PDFs / research papers (optional)
+
+downloads/
+papers/
+
+# ==============================
+
+# Jupyter notebooks
+
+# ==============================
+
+.ipynb_checkpoints/
+
+# ==============================
+
+# Coverage reports
+
+# ==============================
+
+coverage/
+coverage.xml
+*.cover
+
+# ==============================
+
+# Mac / Linux junk
+
+# ==============================
+
+*.pid
+*.seed
+*.out
+*.err
+
+# ==============================
+
+# Secrets
+
+# ==============================
+
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+*.secret
+
+# ==============================
+
+# Misc
+
+# ==============================
+
+*.bak
+*.backup
+*.old
