@@ -1,13 +1,75 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-from langchain_community.llms import Ollama
+from langchain_ollama import OllamaLLM
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import re
+import hashlib
+import time
+import asyncio
+from contextlib import asynccontextmanager
 
-app = FastAPI()
 
-llm = Ollama(model="llama3")
+# ─────────────────────────────────────────────────────
+# Global State
+# ─────────────────────────────────────────────────────
 
+_executor = ThreadPoolExecutor(max_workers=4)
+
+_summary_cache = {}
+CACHE_TTL = 300
+
+
+def cleanup_cache():
+    now = time.time()
+    expired = [k for k, (ts, _) in _summary_cache.items() if now - ts > CACHE_TTL]
+    for k in expired:
+        del _summary_cache[k]
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    yield
+    print("[*] Server shutting down")
+    _executor.shutdown(wait=False)
+
+
+app = FastAPI(lifespan=lifespan)
+
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# ─────────────────────────────────────────────────────
+# LLM CONFIG
+# ─────────────────────────────────────────────────────
+
+llm = OllamaLLM(
+    model="llama3",
+    num_predict=400,
+    num_ctx=4096,
+    temperature=0.2,
+)
+
+
+text_splitter = RecursiveCharacterTextSplitter(
+    chunk_size=6000,
+    chunk_overlap=400,
+)
+
+
+# ─────────────────────────────────────────────────────
+# Models
+# ─────────────────────────────────────────────────────
 
 class PageRequest(BaseModel):
     content: str
@@ -22,257 +84,276 @@ class ExplainRequest(BaseModel):
     text: str
 
 
-def split_text(text, chunk_size=4000):
-    chunks = []
-    start = 0
+# ─────────────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────────────
 
-    while start < len(text):
-        chunks.append(text[start:start + chunk_size])
-        start += chunk_size
+def _sse(event: str, data: dict):
+    return f"event: {event}\ndata: {json.dumps(data)}\n\n"
 
-    return chunks
 
+def _cache_key(content: str):
+    return hashlib.md5(content[:2000].encode()).hexdigest()
+
+
+def _safe_invoke_llm(prompt: str, label="LLM"):
+    for attempt in range(2):
+        try:
+            print(f"[*] Calling LLM [{label}]...")
+            start = time.time()
+            res = llm.invoke(prompt)
+            print(f"[+] LLM [{label}] responded in {time.time() - start:.2f}s")
+            return res
+        except Exception as e:
+            print(f"[!] {label} attempt {attempt+1} failed:", e)
+            if attempt == 1:
+                return f"Error: {str(e)}"
+            time.sleep(2)
+
+
+# ─────────────────────────────────────────────────────
+# Health Routes
+# ─────────────────────────────────────────────────────
+
+@app.get("/")
+@app.get("/health")
+def health():
+    return {"status": "ok", "model": "llama3"}
+
+
+# ─────────────────────────────────────────────────────
+# Summarization
+# ─────────────────────────────────────────────────────
 
 @app.post("/summarize")
-def summarize(page: PageRequest):
+async def summarize(page: PageRequest):
 
-    chunks = split_text(page.content)
+    async def generate():
 
-    partial_summaries = []
+        try:
 
-    for chunk in chunks:
+            cleanup_cache()
 
-        prompt = f"""
-You are a research assistant.
+            content = page.content[:80000]
 
-Summarize the following part of an article.
+            key = _cache_key(content)
 
-Return a concise summary.
+            if key in _summary_cache:
 
-Text:
-{chunk}
-"""
+                ts, data = _summary_cache[key]
 
-        result = llm.invoke(prompt)
+                if time.time() - ts < CACHE_TTL:
 
-        partial_summaries.append(result)
+                    yield _sse("start", {"total_chunks": 1})
+                    yield _sse("chunk", {"done": 1, "total": 1, "pct": 80})
+                    yield _sse("done", data)
+                    return
 
-    combined = "\n".join(partial_summaries)
+            chunks = text_splitter.split_text(content)
+            total = len(chunks)
 
-    final_prompt = f"""
-You are a research assistant.
+            if total == 0:
+                yield _sse("error", {"message": "Empty content"})
+                return
 
-Combine the following summaries into a structured summary.
+            yield _sse("start", {"total_chunks": total})
 
-Return in this format:
+            partial = [""] * total
 
-TLDR:
-(2-3 sentence summary)
+            prompt_template = (
+                "Summarize this research section concisely.\n\n"
+                "Return only the summary.\n\n"
+                "Text:\n{chunk}"
+            )
 
-Key Concepts:
-- concept 1
-- concept 2
-- concept 3
+            futures = {
+                _executor.submit(
+                    _safe_invoke_llm,
+                    prompt_template.format(chunk=c),
+                    f"chunk {i+1}",
+                ): i
+                for i, c in enumerate(chunks)
+            }
 
-Key Findings:
-- finding 1
-- finding 2
+            done = 0
 
-Summaries:
-{combined}
-"""
+            for f in as_completed(futures):
 
-    final_result = llm.invoke(final_prompt)
+                idx = futures[f]
 
-    return {"summary": final_result}
+                partial[idx] = await asyncio.to_thread(f.result)
 
+                done += 1
+
+                pct = round((done / total) * 80)
+
+                yield _sse("chunk", {"done": done, "total": total, "pct": pct})
+
+            yield _sse("reduce", {"message": "Composing summary"})
+
+            combined = "\n\n".join(partial)
+
+            final_prompt = (
+                "Create structured research summary.\n\n"
+                "TLDR:\n\n"
+                "Key Concepts:\n\n"
+                "Key Findings:\n\n"
+                f"Input:\n{combined}"
+            )
+
+            result = await asyncio.to_thread(_safe_invoke_llm, final_prompt, "reduce")
+
+            data = {"summary": result, "chunks_processed": total}
+
+            _summary_cache[key] = (time.time(), data)
+
+            yield _sse("done", data)
+
+        except Exception as e:
+
+            print("Summarization error:", e)
+
+            yield _sse("error", {"message": str(e)})
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+        },
+    )
+
+
+# ─────────────────────────────────────────────────────
+# Ask
+# ─────────────────────────────────────────────────────
 
 @app.post("/ask")
-def ask_question(req: QuestionRequest):
-
-    text = req.content[:8000]
-
-    prompt = f"""
-You are an expert research assistant.
-
-Answer the question using ONLY the article.
-
-If the answer is not in the article say:
-"The article does not mention this."
-
-Article:
-{text}
-
-Question:
-{req.question}
-
-Answer:
-"""
-
-    result = llm.invoke(prompt)
-
-    return {"answer": result}
-
-
-@app.post("/insights")
-def extract_insights(page: PageRequest):
-
-    text = page.content[:8000]
-
-    prompt = f"""
-You are an expert research analyst.
-
-Analyze the following article and extract structured research insights.
-
-Return in the following format:
-
-Problem:
-(What problem does the article address?)
-
-Methodology:
-(How does the article attempt to solve it?)
-
-Findings:
-(What are the main results?)
-
-Evidence:
-(What experiments, data, or arguments support the findings?)
-
-Limitations:
-(What are weaknesses or constraints?)
-
-Article:
-{text}
-"""
-
-    result = llm.invoke(prompt)
-
-    return {
-        "insights": result
-    }
-
-
-@app.post("/graph")
-def generate_graph(page: PageRequest):
-
-    text = page.content[:8000]
-
-    prompt = f"""
-You extract relationships from articles.
-
-Return ONLY valid JSON.
-
-Format:
-
-[
-  {{"source":"Entity1","relation":"relationship","target":"Entity2"}},
-  {{"source":"EntityA","relation":"relationship","target":"EntityB"}}
-]
-
-Do NOT include explanations.
-Do NOT include markdown.
-Do NOT include ```json.
-
-Article:
-{text}
-"""
-
-    result = llm.invoke(prompt)
+def ask(req: QuestionRequest):
 
     try:
-        cleaned = re.sub(r"```json|```", "", result).strip()
-        graph = json.loads(cleaned)
-    except:
-        graph = []
 
-    return {
-        "graph": graph
-    }
+        context = req.content[:15000]
 
+        prompt = (
+            "Answer the question using only the article.\n\n"
+            f"{context}\n\n"
+            f"Question: {req.question}\nAnswer:"
+        )
+
+        ans = _safe_invoke_llm(prompt, "ask")
+
+        return {"answer": ans}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ─────────────────────────────────────────────────────
+# Insights
+# ─────────────────────────────────────────────────────
+
+@app.post("/insights")
+def insights(page: PageRequest):
+
+    try:
+        context = page.content[:15000]
+
+        prompt = (
+            "Identify the 3 most important scientific or research insights from this text.\n\n"
+            "Format as a list of points.\n\n"
+            f"Content:\n{context}"
+        )
+
+        res = _safe_invoke_llm(prompt, "insights")
+
+        return {"insights": res}
+
+    except Exception as e:
+        print("[!] Insights error:", e)
+        return {"insights": "Could not extract insights at this time."}
+
+
+# ─────────────────────────────────────────────────────
+# Graph
+# ─────────────────────────────────────────────────────
+
+@app.post("/graph")
+def graph(page: PageRequest):
+
+    try:
+
+        context = page.content[:10000]
+
+        prompt = (
+            "Extract entity relationships.\n"
+            "Return JSON array: "
+            '[{"source":"","relation":"","target":""}]\n\n'
+            f"{context}"
+        )
+
+        raw = _safe_invoke_llm(prompt)
+
+        cleaned = re.sub(r"```(?:json)?|```", "", raw).strip()
+
+        start = cleaned.find("[")
+        end = cleaned.rfind("]")
+
+        if start != -1 and end != -1:
+
+            edges = json.loads(cleaned[start:end + 1])
+
+            return {"graph": edges[:40]}
+
+        return {"graph": []}
+
+    except Exception:
+
+        return {"graph": []}
+
+
+# ─────────────────────────────────────────────────────
+# Bias
+# ─────────────────────────────────────────────────────
 
 @app.post("/bias")
-def detect_bias(page: PageRequest):
+def bias(page: PageRequest):
 
-    text = page.content[:8000]
+    context = page.content[:15000]
 
-    prompt = f"""
-You are an expert research reviewer.
+    prompt = (
+        "Critique research methodology.\n\n"
+        "Possible Bias:\n"
+        "Weak Arguments:\n"
+        "Missing Evidence:\n"
+        "Logical Flaws:\n\n"
+        f"{context}"
+    )
 
-Analyze the following article and identify critical evaluation points.
+    res = _safe_invoke_llm(prompt)
 
-Return in the following format:
-
-Possible Bias:
-(Does the article show bias or favor a particular viewpoint?)
-
-Weak Arguments:
-(Identify arguments that lack strong support)
-
-Missing Evidence:
-(Claims made without sufficient evidence)
-
-Limitations:
-(Constraints or weaknesses in the study or article)
-
-Article:
-{text}
-"""
-
-    result = llm.invoke(prompt)
-
-    return {
-        "bias": result
-    }
+    return {"bias": res}
 
 
-@app.post("/explain")
-def explain_text(req: ExplainRequest):
-
-    text = req.text[:1000]
-
-    prompt = f"""
-You are an expert teacher.
-
-Explain the following concept in a very simple way.
-
-Return in this format:
-
-Concept:
-(rewrite the concept briefly)
-
-Explanation:
-(simple explanation)
-
-Analogy:
-(give an everyday analogy)
-
-Text:
-{text}
-"""
-
-    result = llm.invoke(prompt)
-
-    return {
-        "explanation": result
-    }
-
+# ─────────────────────────────────────────────────────
+# Reading Time
+# ─────────────────────────────────────────────────────
 
 @app.post("/reading-time")
 def reading_time(page: PageRequest):
 
-    text = page.content
+    words = len(page.content.split())
 
-    words = len(text.split())
+    read_time = words / 200
 
-    reading_time = words / 200
+    sum_time = 2
 
-    summary_time = 2
-
-    efficiency = (1 - summary_time / reading_time) * 100 if reading_time > 0 else 0
+    eff = (1 - (sum_time / read_time)) * 100 if read_time else 0
 
     return {
         "word_count": words,
-        "reading_time": round(reading_time, 2),
-        "summary_time": summary_time,
-        "efficiency_gain": round(efficiency, 2)
+        "reading_time": round(read_time, 2),
+        "summary_time": sum_time,
+        "efficiency_gain": round(eff, 2),
     }
